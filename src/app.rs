@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use crate::capture::{CaptureWorker, capability_report};
+use crate::capture::capability_report;
 use crate::geometry::{TargetGeometry, aim_cursor, image_to_client};
 use crate::input::NotesReceiver;
 use crate::keys::{parse_combo, parse_sequence};
@@ -33,7 +33,8 @@ enum PanelTab {
 pub struct WinPilotApp {
     windows: Vec<WindowInfo>,
     selected: Option<isize>,
-    worker: Option<CaptureWorker>,
+    /// 上一次向 session 认领的会话代数，变了说明有外部（MCP）切换了目标
+    generation: u64,
     events_rx: Option<CaptureEventReceiver>,
     texture: Option<egui::TextureHandle>,
     frame_size: (usize, usize),
@@ -102,7 +103,7 @@ impl WinPilotApp {
         let mut app = Self {
             windows: Vec::new(),
             selected: None,
-            worker: None,
+            generation: 0,
             events_rx: None,
             texture: None,
             frame_size: (0, 0),
@@ -224,50 +225,20 @@ impl WinPilotApp {
         }
     }
 
+    /// 启动按钮/自动选中：走 session 的唯一入口，并重置本地预览状态。
     fn start_capture(&mut self) {
-        self.stop_capture();
-
         let Some(hwnd) = self.selected else { return };
-        match CaptureWorker::start(hwnd) {
-            Ok((worker, events_rx, frame_slot)) => {
-                self.worker = Some(worker);
-                self.events_rx = Some(events_rx);
-                self.texture = None;
-                self.frame_size = (0, 0);
-                self.total_frames = 0;
-                self.fps = 0.0;
-                self.fps_count = 0;
-                self.fps_since = Instant::now();
-                self.frame_latency_ms = 0.0;
-                self.frame_is_client = None;
-                self.hover = None;
-                self.picked = None;
-                self.push_log(format!("抓取已启动 hwnd=0x{hwnd:X}"));
-
-                self.geometry = match TargetGeometry::query(hwnd) {
-                    Ok(geometry) => {
-                        self.push_log(format!(
-                            "客户区 {}×{} 窗口 {}×{} DPI={} 感知={}",
-                            geometry.client_w,
-                            geometry.client_h,
-                            geometry.window_w,
-                            geometry.window_h,
-                            geometry.dpi,
-                            geometry.awareness
-                        ));
-                        Some(geometry)
-                    }
-                    Err(error) => {
-                        self.push_log(format!("读取窗口几何失败: {error:#}"));
-                        None
-                    }
-                };
-
-                // 把会话事实镜像给 MCP server：目标、几何、最新帧槽位
-                let info = self.windows.iter().find(|w| w.hwnd == hwnd).cloned();
-                self.session.set_selected(info);
-                self.session.set_geometry(self.geometry);
-                self.session.set_frame_slot(Some(frame_slot));
+        match self.session.ensure_capture(hwnd) {
+            Ok((receiver, geometry)) => {
+                self.adopt_receiver(receiver);
+                self.geometry = Some(geometry);
+                self.generation = self.session.generation();
+                self.push_log(
+                    self.session
+                        .selected()
+                        .map(|info| format!("目标 {}", info.label()))
+                        .unwrap_or_else(|| format!("抓取已启动 hwnd=0x{hwnd:X}")),
+                );
             }
             Err(error) => {
                 self.geometry = None;
@@ -277,42 +248,53 @@ impl WinPilotApp {
     }
 
     fn stop_capture(&mut self) {
-        if let Some(worker) = self.worker.take() {
-            worker.stop();
-            self.push_log("抓取已停止");
-        }
+        self.session.stop_capture();
+        self.generation = self.session.generation();
         self.events_rx = None;
-        self.session.set_frame_slot(None);
+        self.geometry = None;
     }
 
-    /// MCP 的 select_window 在共享会话里排队，这里取走并当作本机的选择执行。
-    /// 抓取会话的生命周期始终由 GUI 统一管理。
-    ///
-    /// 同一窗口且画面仍然新鲜时跳过重启；其余情况（换了目标、上次启动失败、
-    /// 窗口最小化导致断帧）都重新走一遍启动流程——启动会顺带恢复最小化的窗口。
-    fn handle_pending_select(&mut self) {
-        let pending = self
-            .session
-            .pending_select
-            .lock()
-            .ok()
-            .and_then(|mut guard| guard.take());
-        let Some(hwnd) = pending else { return };
+    /// 会话代数变化（MCP 切换了目标或停止）时，向 session 认领新状态。
+    /// 抓取会话的生命周期由 session 统一管理，GUI 只是跟随者。
+    fn sync_session(&mut self) {
+        let generation = self.session.generation();
+        if generation == self.generation {
+            return;
+        }
+        self.generation = generation;
 
-        if self.selected == Some(hwnd) {
-            let fresh = self.worker.as_ref().is_some_and(|worker| worker.is_alive())
-                && self
-                    .session
-                    .frame_slot()
-                    .and_then(|slot| slot.age_ms())
-                    .is_some_and(|age| age < 1000);
-            if fresh {
-                return;
+        if let Some(info) = self.session.selected() {
+            if self.selected != Some(info.hwnd) {
+                self.selected = Some(info.hwnd);
+                self.push_log(format!("外部切换目标：{}", info.label()));
             }
         }
+        match self.session.receiver() {
+            Some(receiver) => {
+                self.adopt_receiver(receiver);
+                self.geometry = self.session.geometry();
+                self.push_log("已跟随外部会话变更");
+            }
+            None => {
+                self.events_rx = None;
+                self.geometry = None;
+            }
+        }
+    }
 
-        self.selected = Some(hwnd);
-        self.start_capture();
+    /// 认领一份新的帧接收端：预览与坐标映射状态全部归零重来。
+    fn adopt_receiver(&mut self, receiver: CaptureEventReceiver) {
+        self.events_rx = Some(receiver);
+        self.texture = None;
+        self.frame_size = (0, 0);
+        self.total_frames = 0;
+        self.fps = 0.0;
+        self.fps_count = 0;
+        self.fps_since = Instant::now();
+        self.frame_latency_ms = 0.0;
+        self.frame_is_client = None;
+        self.hover = None;
+        self.picked = None;
     }
 
     /// 只取最新一帧，中间帧全部丢弃，保证预览延迟最低。返回本次是否用上了新画面。
@@ -367,15 +349,11 @@ impl WinPilotApp {
                 self.fps = self.fps_count as f32 / elapsed;
                 self.fps_count = 0;
                 self.fps_since = Instant::now();
-                if let Ok(mut mirror) = self.session.fps.lock() {
-                    *mirror = self.fps;
-                }
             }
         }
 
         if target_closed {
             self.push_log("目标窗口已关闭，抓取结束");
-            self.worker = None;
             self.events_rx = None;
             self.texture = None;
             self.frame_size = (0, 0);
@@ -545,8 +523,8 @@ impl WinPilotApp {
 
     /// 运行状态读数。延迟与积压是判断"点了没反应"到底卡在哪一环节的依据。
     fn status_section(&mut self, ui: &mut egui::Ui) {
-        let capturing = self.worker.is_some();
-        let alive = self.worker.as_ref().is_some_and(|worker| worker.is_alive());
+        let capturing = self.session.capture_alive() || self.events_rx.is_some();
+        let alive = self.session.capture_alive();
         let backlog = self.session.input.backlog();
         let (width, height) = self.frame_size;
 
@@ -592,7 +570,7 @@ impl WinPilotApp {
         let selected_label = self
             .selected
             .and_then(|hwnd| self.windows.iter().find(|w| w.hwnd == hwnd).map(|w| w.label()));
-        let capturing = self.worker.is_some();
+        let capturing = self.session.capture_alive();
 
         Self::section(ui, "目标窗口", |ui| {
             ui.horizontal(|ui| {
@@ -864,7 +842,7 @@ impl WinPilotApp {
 impl eframe::App for WinPilotApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
-        self.handle_pending_select();
+        self.sync_session();
         let fresh = self.poll_frames(&ctx);
         self.drain_notes();
 

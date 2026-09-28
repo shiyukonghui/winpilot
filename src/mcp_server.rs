@@ -25,8 +25,9 @@ const DEFAULT_PORT: u16 = 8100;
 /// 帧龄超过该值视为过期画面（目标最小化或静止时 WGC 不产帧），返回里用 stale 标出。
 const STALE_FRAME_MS: u128 = 1000;
 
-/// 在独立线程上启动 tokio runtime 与 Streamable HTTP 服务，挂靠当前 GUI 进程。
-pub fn start(session: Arc<SharedSession>, gui: egui::Context, port: Option<u16>) {
+/// 在独立线程上启动 tokio runtime 与 Streamable HTTP 服务。
+/// 挂靠 GUI 进程或无头 `--serve` 模式下都由这里承载 MCP。
+pub fn start(session: Arc<SharedSession>, port: Option<u16>) {
     let port = port.unwrap_or(DEFAULT_PORT);
     let spawned = std::thread::Builder::new()
         .name("mcp-server".to_owned())
@@ -42,7 +43,7 @@ pub fn start(session: Arc<SharedSession>, gui: egui::Context, port: Option<u16>)
                     return;
                 }
             };
-            if let Err(error) = runtime.block_on(serve(session, gui, port)) {
+            if let Err(error) = runtime.block_on(serve(session, port)) {
                 tracing::error!("MCP server 退出: {error:#}");
             }
         });
@@ -52,17 +53,12 @@ pub fn start(session: Arc<SharedSession>, gui: egui::Context, port: Option<u16>)
     }
 }
 
-async fn serve(
-    session: Arc<SharedSession>,
-    gui: egui::Context,
-    port: u16,
-) -> anyhow::Result<()> {
+async fn serve(session: Arc<SharedSession>, port: u16) -> anyhow::Result<()> {
     let session_manager = Arc::new(LocalSessionManager::default());
     let service = StreamableHttpService::new(
         move || {
             Ok(WinPilotTools {
                 session: session.clone(),
-                gui: gui.clone(),
             })
         },
         session_manager,
@@ -141,7 +137,6 @@ pub struct MoveRelArgs {
 #[derive(Clone)]
 pub struct WinPilotTools {
     session: Arc<SharedSession>,
-    gui: egui::Context,
 }
 
 #[tool_router]
@@ -164,7 +159,7 @@ impl WinPilotTools {
         Ok(text_result(serde_json::json!({ "windows": items })))
     }
 
-    #[tool(description = "选择目标窗口并开始抓取（由 GUI 在下一帧执行）。之后才能 screenshot 和 click。")]
+    #[tool(description = "选择目标窗口并启动抓取，返回目标信息与客户区几何。之后才能 screenshot 和 click。重复选择同一目标且画面新鲜时直接复用当前会话。")]
     async fn select_window(
         &self,
         Parameters(args): Parameters<SelectWindowArgs>,
@@ -182,13 +177,18 @@ impl WinPilotTools {
             )));
         };
 
-        if let Ok(mut pending) = self.session.pending_select.lock() {
-            *pending = Some(info.hwnd);
-        }
-        self.gui.request_repaint();
+        // 直接启动抓取会话（内部会自动恢复最小化窗口），无头/挂靠模式行为一致
+        let session = self.session.clone();
+        let hwnd = info.hwnd;
+        let geometry = tokio::task::spawn_blocking(move || session.ensure_capture(hwnd))
+            .await
+            .map_err(|error| mcp_error(anyhow::format_err!("抓取任务失败: {error}")))?
+            .map_err(mcp_error)?;
+
         Ok(text_result(serde_json::json!({
-            "selected": { "hwnd": info.hwnd, "process": info.process_name, "title": info.title },
-            "note": "抓取正在启动，稍等片刻后调用 capture_status 确认",
+            "selected": { "hwnd": info.hwnd, "process": info.process_name, "title": info.title, "minimized": info.minimized },
+            "client_size": [geometry.1.client_w, geometry.1.client_h],
+            "note": "抓取已启动，可用 capture_status 确认 stale:false 后再 screenshot",
         })))
     }
 
@@ -366,7 +366,7 @@ impl WinPilotTools {
                     "stale": age_ms > STALE_FRAME_MS,
                 })
             });
-        let fps = self.session.fps.lock().map(|fps| *fps).unwrap_or(0.0);
+        let fps = self.session.fps();
         let backlog = self.session.input.backlog();
         serde_json::json!({
             "selected": selected,

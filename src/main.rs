@@ -60,6 +60,33 @@ fn main() -> Result<()> {
         return burst_self_test(pattern, spec, count);
     }
 
+    let auto = flag_value(&args, "--auto").map(str::to_owned);
+    let headless = args.iter().any(|a| a == "--serve");
+
+    // 共享会话：GUI、无头模式与 MCP server 操作同一个实例
+    let (notes_tx, notes_rx) = unbounded();
+    let input = input::InputWorker::spawn(notes_tx.clone());
+    let session = session::SharedSession::start(input, notes_tx);
+
+    if headless {
+        // 无头模式：不启动界面，MCP server 是唯一操控入口；--serve 默认开启 8100 端口
+        let port = mcp_port(&args).unwrap_or(8100);
+        if let Some(pattern) = auto.as_deref() {
+            headless_autostart(&session, pattern)?;
+        }
+        mcp_server::start(session, Some(port));
+        let logger = std::thread::spawn(move || {
+            while let Ok(note) = notes_rx.recv() {
+                tracing::info!(target: "input", "{note}");
+            }
+        });
+        let _ = logger;
+        tracing::info!("WinPilot 无头模式运行中（无界面），Ctrl+C 退出");
+        loop {
+            std::thread::sleep(Duration::from_secs(3600));
+        }
+    }
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1280.0, 780.0])
@@ -68,20 +95,12 @@ fn main() -> Result<()> {
         ..Default::default()
     };
 
-    let auto = flag_value(&args, "--auto").map(str::to_owned);
-
-    // 共享会话：GUI 与 MCP server 操作同一个实例
-    let (notes_tx, notes_rx) = unbounded();
-    let input = input::InputWorker::spawn(notes_tx);
-    let session = std::sync::Arc::new(session::SharedSession::new(input));
-
     eframe::run_native(
         "WinPilot",
         options,
         Box::new(move |cc| {
-            // MCP server 要用真实的 GUI Context 来唤醒界面处理 select_window
             if let Some(port) = mcp_port(&args) {
-                mcp_server::start(session.clone(), cc.egui_ctx.clone(), Some(port));
+                mcp_server::start(session.clone(), Some(port));
             }
             Ok(Box::new(WinPilotApp::new(
                 &cc.egui_ctx,
@@ -103,6 +122,29 @@ fn mcp_port(args: &[String]) -> Option<u16> {
             .and_then(|value| value.parse::<u16>().ok())
             .unwrap_or(8100)
     })
+}
+
+/// 无头模式的 --auto：直接启动对目标的抓取会话。
+fn headless_autostart(session: &session::SharedSession, pattern: &str) -> Result<()> {
+    let windows = list_capturable_windows()?;
+    let lowered = pattern.to_lowercase();
+    let Some(info) = windows.iter().find(|w| {
+        w.title.contains(pattern) || w.process_name.to_lowercase().contains(&lowered)
+    }) else {
+        println!("[serve] --auto 未匹配到 {pattern:?}，当前可抓取窗口：");
+        for w in &windows {
+            println!("  {}", w.label());
+        }
+        return Ok(());
+    };
+    let (_, geometry) = session.ensure_capture(info.hwnd)?;
+    println!(
+        "[serve] 目标 {} 客户区 {}×{}",
+        info.label(),
+        geometry.client_w,
+        geometry.client_h
+    );
+    Ok(())
 }
 
 fn flag_value<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
@@ -200,7 +242,7 @@ fn send_self_test(pattern: &str, specs: &[String]) -> Result<()> {
     println!("[send] 发送 {} 条指令", actions.len());
 
     let (notes_tx, notes_rx) = unbounded();
-    let input = input::InputWorker::spawn(notes_tx);
+    let input = input::InputWorker::spawn(notes_tx.clone());
     drop(first);
 
     let before = latest_frame(&receiver);
@@ -266,7 +308,7 @@ fn latency_self_test(pattern: &str, specs: &[String]) -> Result<()> {
     );
 
     let (notes_tx, _notes_rx) = unbounded();
-    let input = input::InputWorker::spawn(notes_tx);
+    let input = input::InputWorker::spawn(notes_tx.clone());
 
     let mut stale_max = Duration::ZERO;
     let mut totals = Vec::new();
@@ -365,7 +407,7 @@ fn burst_self_test(pattern: &str, spec: &str, count: usize) -> Result<()> {
     println!("[burst] 目标 {}，指令 {spec} ×{count}", info.label());
 
     let (notes_tx, notes_rx) = unbounded();
-    let input = input::InputWorker::spawn(notes_tx);
+    let input = input::InputWorker::spawn(notes_tx.clone());
 
     let started = Instant::now();
     for _ in 0..count {

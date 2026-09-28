@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -42,12 +43,30 @@ pub struct FramePacket {
 
 /// 最新一帧的共享槽位。抓取回调写入，MCP 的 screenshot 等工具读取，
 /// 与预览信箱互不干扰：UI 走信箱，外部工具走槽位。
+/// 最新一帧的共享槽位。抓取回调写入，MCP 的 screenshot 等工具读取，
+/// 与预览信箱互不干扰：UI 走信箱，外部工具走槽位。
+/// `count` 随每帧递增，供外部采样计算真实抓取帧率。
 #[derive(Clone, Default)]
-pub struct FrameSlot(Arc<Mutex<Option<Arc<FramePacket>>>>);
+pub struct FrameSlot {
+    slot: Arc<Mutex<Option<Arc<FramePacket>>>>,
+    count: Arc<AtomicU64>,
+}
 
 impl FrameSlot {
     pub fn get(&self) -> Option<Arc<FramePacket>> {
-        self.0.lock().ok().and_then(|slot| slot.clone())
+        self.slot.lock().ok().and_then(|slot| slot.clone())
+    }
+
+    pub fn set(&self, packet: Arc<FramePacket>) {
+        if let Ok(mut slot) = self.slot.lock() {
+            *slot = Some(packet);
+        }
+        self.count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// 累计写入的帧数，两次采样之差即这段时间的抓取帧数。
+    pub fn count(&self) -> u64 {
+        self.count.load(Ordering::Relaxed)
     }
 
     /// 帧龄（毫秒），调用方据此判断画面是否新鲜。
@@ -55,13 +74,6 @@ impl FrameSlot {
         self.get()
             .map(|packet| packet.captured_at.elapsed().as_millis())
     }
-
-    pub fn set(&self, packet: Arc<FramePacket>) {
-        if let Ok(mut slot) = self.0.lock() {
-            *slot = Some(packet);
-        }
-    }
-
 }
 
 pub enum CaptureEvent {
