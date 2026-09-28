@@ -22,6 +22,13 @@ struct MappedPoint {
     screen: Option<(i32, i32)>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PanelTab {
+    Mouse,
+    Keyboard,
+    Log,
+}
+
 pub struct WinPilotApp {
     windows: Vec<WindowInfo>,
     selected: Option<isize>,
@@ -45,6 +52,7 @@ pub struct WinPilotApp {
     key_spec: String,
     text_input: String,
     relative_move: String,
+    tab: PanelTab,
 }
 
 /// egui 自带字体不含中日韩字形，需要注入一个系统中文字体作为回退，否则界面全是方块。
@@ -109,6 +117,7 @@ impl WinPilotApp {
             key_spec: String::new(),
             text_input: String::new(),
             relative_move: "0,0".to_owned(),
+            tab: PanelTab::Mouse,
         };
         app.refresh_windows();
 
@@ -429,7 +438,22 @@ impl WinPilotApp {
         }
     }
 
-    fn point_row(&self, ui: &mut egui::Ui, label: &str, point: Option<MappedPoint>) {
+    fn aim_picked(&mut self) {
+        let (Some(picked), Some(geometry), Some(hwnd)) =
+            (self.picked, self.geometry, self.selected)
+        else {
+            return;
+        };
+        match aim_cursor(hwnd, &geometry, self.frame_size, picked.image) {
+            Ok(screen) => self.push_log(format!(
+                "光标移到屏幕 {screen:?}，对应客户区 ({},{})（只移动，未点击）",
+                picked.client.0, picked.client.1
+            )),
+            Err(error) => self.push_log(format!("光标定位失败: {error:#}")),
+        }
+    }
+
+    fn point_row(ui: &mut egui::Ui, label: &str, point: Option<MappedPoint>) {
         let Some(point) = point else {
             ui.monospace(format!("{label}：—"));
             return;
@@ -444,73 +468,113 @@ impl WinPilotApp {
         ));
     }
 
+    /// 分组框默认按内容收缩，这里显式撑满面板宽度，避免左右边缘参差不齐。
+    fn section(ui: &mut egui::Ui, title: &str, add_contents: impl FnOnce(&mut egui::Ui)) {
+        let inner_width = (ui.available_width() - 24.0).max(140.0);
+        ui.group(|ui| {
+            ui.set_min_width(inner_width);
+            ui.label(egui::RichText::new(title).strong());
+            ui.separator();
+            add_contents(ui);
+        });
+        ui.add_space(6.0);
+    }
+
     fn controls_ui(&mut self, ui: &mut egui::Ui) {
         ui.heading("WinPilot");
         ui.separator();
 
-        ui.group(|ui| {
-            ui.label("目标窗口");
-            if ui.button("刷新列表").clicked() {
-                self.refresh_windows();
-            }
+        // 各分区加起来超过窗口高度，整体可滚动，任何分区都不会被裁掉
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                self.target_section(ui);
+                self.mapping_section(ui);
+                self.action_section(ui);
+            });
+    }
 
-            // 取出 vec 再遍历，避免与 self.selected 的可变借用冲突
-            let windows = std::mem::take(&mut self.windows);
-            egui::ScrollArea::vertical()
-                .max_height(220.0)
-                .auto_shrink([false, false])
+    fn target_section(&mut self, ui: &mut egui::Ui) {
+        let selected_label = self
+            .selected
+            .and_then(|hwnd| self.windows.iter().find(|w| w.hwnd == hwnd).map(|w| w.label()));
+        let capturing = self.worker.is_some();
+
+        Self::section(ui, "目标窗口", |ui| {
+            ui.horizontal(|ui| {
+                if ui.button("刷新列表").clicked() {
+                    self.refresh_windows();
+                }
+                ui.weak(selected_label.unwrap_or_else(|| "未选择".to_owned()));
+            });
+
+            let count = self.windows.len();
+            egui::CollapsingHeader::new(format!("窗口列表（{count}）"))
+                .default_open(true)
                 .show(ui, |ui| {
-                    if windows.is_empty() {
-                        ui.weak("没有可用窗口");
-                    }
-                    for info in &windows {
-                        let label = info.label();
-                        ui.selectable_value(&mut self.selected, Some(info.hwnd), label);
-                    }
+                    // 取出 vec 再遍历，避免与 self.selected 的可变借用冲突
+                    let windows = std::mem::take(&mut self.windows);
+                    egui::ScrollArea::vertical()
+                        .max_height(170.0)
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            if windows.is_empty() {
+                                ui.weak("没有可用窗口");
+                            }
+                            for info in &windows {
+                                let label = info.label();
+                                ui.selectable_value(&mut self.selected, Some(info.hwnd), label);
+                            }
+                        });
+                    self.windows = windows;
                 });
-            self.windows = windows;
-        });
 
-        ui.group(|ui| {
-            ui.label("画面抓取");
-            if self.worker.is_some() {
+            ui.add_space(4.0);
+            if capturing {
                 if ui.button("停止抓取").clicked() {
                     self.stop_capture();
                 }
             } else {
-                let button = ui.add_enabled(
-                    self.selected.is_some(),
-                    egui::Button::new("开始抓取").min_size(egui::vec2(200.0, 26.0)),
-                );
-                if button.clicked() {
+                let button = egui::Button::new("开始抓取").min_size(egui::vec2(120.0, 26.0));
+                if ui.add_enabled(self.selected.is_some(), button).clicked() {
                     self.start_capture();
                 }
                 if self.selected.is_none() {
-                    ui.weak("请先在上方选择一个窗口");
+                    ui.weak("先在上方列表里选一个窗口");
                 }
             }
         });
+    }
 
-        ui.group(|ui| {
-            ui.label("坐标映射");
-            match self.geometry {
+    fn mapping_section(&mut self, ui: &mut egui::Ui) {
+        let geometry = self.geometry;
+        let frame_is_client = self.frame_is_client;
+        let hover = self.hover;
+        let picked = self.picked;
+
+        Self::section(ui, "坐标映射", |ui| {
+            match geometry {
                 Some(geometry) => {
                     ui.label(format!(
-                        "客户区 {}×{}  窗口 {}×{}",
-                        geometry.client_w, geometry.client_h, geometry.window_w, geometry.window_h
+                        "客户区 {}×{} · 窗口 {}×{} · DPI {} · {}",
+                        geometry.client_w,
+                        geometry.client_h,
+                        geometry.window_w,
+                        geometry.window_h,
+                        geometry.dpi,
+                        geometry.awareness
                     ));
-                    ui.label(format!("DPI {}  感知 {}", geometry.dpi, geometry.awareness));
-                    match self.frame_is_client {
+                    match frame_is_client {
                         Some(true) => {
                             ui.colored_label(
                                 egui::Color32::from_rgb(70, 200, 130),
-                                "画面尺寸 = 客户区，映射为恒等换算",
+                                "画面 = 客户区，恒等换算",
                             );
                         }
                         Some(false) => {
                             ui.colored_label(
                                 egui::Color32::YELLOW,
-                                "画面尺寸 ≠ 客户区，已改用比例换算",
+                                "画面 ≠ 客户区，已改用比例换算",
                             );
                         }
                         None => {
@@ -518,196 +582,188 @@ impl WinPilotApp {
                         }
                     }
                 }
-                None => { ui.weak("开始抓取后可用"); }
+                None => {
+                    ui.weak("开始抓取后可用");
+                }
             }
 
             ui.separator();
-            self.point_row(ui, "鼠标指向", self.hover);
-            self.point_row(ui, "已选中  ", self.picked);
+            Self::point_row(ui, "指向", hover);
+            Self::point_row(ui, "选点", picked);
 
             ui.horizontal(|ui| {
                 if ui
-                    .add_enabled(self.picked.is_some(), egui::Button::new("清除选点"))
+                    .add_enabled(picked.is_some(), egui::Button::new("清除选点"))
                     .clicked()
                 {
                     self.picked = None;
                 }
-
-                let can_aim =
-                    self.picked.is_some() && self.geometry.is_some() && self.selected.is_some();
+                let can_aim = picked.is_some() && geometry.is_some();
                 if ui
-                    .add_enabled(can_aim, egui::Button::new("把光标移到选点"))
-                    .on_disabled_hover_text("先在左侧预览区点击一个点")
+                    .add_enabled(can_aim, egui::Button::new("光标移到选点"))
+                    .on_disabled_hover_text("先在左侧预览区点一个点")
                     .clicked()
                 {
-                    if let (Some(picked), Some(geometry), Some(hwnd)) =
-                        (self.picked, self.geometry, self.selected)
-                    {
-                        match aim_cursor(hwnd, &geometry, self.frame_size, picked.image) {
-                            Ok(screen) => self.push_log(format!(
-                                "光标已移到屏幕 ({},{})，对应客户区 ({},{})（只移动，未点击）",
-                                screen.0, screen.1, picked.client.0, picked.client.1
-                            )),
-                            Err(error) => {
-                                self.push_log(format!("光标定位失败: {error:#}"));
-                            }
-                        }
-                    }
+                    self.aim_picked();
                 }
             });
         });
+    }
 
-        ui.group(|ui| {
-            ui.label("鼠标动作");
-            let has_point = self.target_point().is_some();
-            if !has_point {
-                ui.weak("先在左侧预览区点一个点作为动作位置");
+    fn action_section(&mut self, ui: &mut egui::Ui) {
+        let log_count = self.log.len();
+        Self::section(ui, "操作", |ui| {
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut self.tab, PanelTab::Mouse, "鼠标");
+                ui.selectable_value(&mut self.tab, PanelTab::Keyboard, "键盘");
+                ui.selectable_value(&mut self.tab, PanelTab::Log, format!("日志({log_count})"));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.checkbox(&mut self.activate_first, "先激活");
+                });
+            });
+            ui.separator();
+
+            match self.tab {
+                PanelTab::Mouse => self.mouse_rows(ui),
+                PanelTab::Keyboard => self.keyboard_rows(ui),
+                PanelTab::Log => self.log_rows(ui),
             }
+        });
+    }
 
-            ui.horizontal_wrapped(|ui| {
-                for (label, button, count) in [
-                    ("左键单击", MouseButton::Left, 1_u32),
-                    ("左键双击", MouseButton::Left, 2),
-                    ("右键单击", MouseButton::Right, 1),
-                    ("中键单击", MouseButton::Middle, 1),
-                ] {
-                    let button_widget =
-                        egui::Button::new(label).min_size(egui::vec2(82.0, 24.0));
-                    if ui
-                        .add_enabled(has_point, button_widget)
-                        .clicked()
-                    {
-                        if let Some(screen) = self.target_point() {
-                            self.dispatch(Action::Click {
-                                screen,
-                                button,
-                                count,
-                            });
-                        }
-                    }
-                }
-            });
+    fn mouse_rows(&mut self, ui: &mut egui::Ui) {
+        let has_point = self.target_point().is_some();
+        if !has_point {
+            ui.weak("先在左侧预览区点一个点作为动作位置");
+        }
 
-            ui.horizontal_wrapped(|ui| {
-                if ui.button("滚轮上").clicked() {
-                    self.dispatch(Action::Scroll { ticks: 3 });
-                }
-                if ui.button("滚轮下").clicked() {
-                    self.dispatch(Action::Scroll { ticks: -3 });
-                }
-                if ui.button("按下左键").clicked() {
-                    self.dispatch(Action::Button {
-                        button: MouseButton::Left,
-                        down: true,
+        ui.horizontal_wrapped(|ui| {
+            for (label, button, count) in [
+                ("左键单击", MouseButton::Left, 1_u32),
+                ("左键双击", MouseButton::Left, 2),
+                ("右键单击", MouseButton::Right, 1),
+                ("中键单击", MouseButton::Middle, 1),
+            ] {
+                let widget = egui::Button::new(label).min_size(egui::vec2(82.0, 24.0));
+                if ui.add_enabled(has_point, widget).clicked()
+                    && let Some(screen) = self.target_point()
+                {
+                    self.dispatch(Action::Click {
+                        screen,
+                        button,
+                        count,
                     });
                 }
-                if ui.button("抬起左键").clicked() {
-                    self.dispatch(Action::Button {
-                        button: MouseButton::Left,
-                        down: false,
-                    });
-                }
-            });
-
-            ui.horizontal(|ui| {
-                ui.label("相对移动");
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.relative_move)
-                        .desired_width(70.0)
-                        .hint_text("dx,dy"),
-                );
-                if ui.button("发送").clicked() {
-                    self.send_relative();
-                }
-            });
+            }
         });
 
-        ui.group(|ui| {
-            ui.label("键盘动作");
-            ui.horizontal(|ui| {
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.key_spec)
-                        .desired_width(210.0)
-                        .hint_text("Ctrl+Left 或 Left Left Space"),
-                );
-                if ui.button("发送").clicked() {
-                    self.send_key_spec();
-                }
-            });
-
-            ui.horizontal_wrapped(|ui| {
-                for key in ["Left", "Right", "Up", "Down", "Space", "Enter", "Esc"] {
-                    if ui.small_button(key).clicked() {
-                        self.send_combo(key);
-                    }
-                }
-            });
-
-            ui.horizontal(|ui| {
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.text_input)
-                        .desired_width(210.0)
-                        .hint_text("要输入的文本"),
-                );
-                if ui.button("输入").clicked() {
-                    let text = std::mem::take(&mut self.text_input);
-                    if text.is_empty() {
-                        self.push_log("文本为空，未发送");
-                    } else {
-                        self.dispatch(Action::Text { text });
-                    }
-                }
-            });
-        });
-
-        ui.group(|ui| {
-            ui.checkbox(&mut self.activate_first, "动作前先激活目标窗口（前台模式）");
-        });
-
-        ui.group(|ui| {
-            let session_alive = self.worker.as_ref().is_some_and(|worker| worker.is_alive());
-            let state = match (&self.worker, session_alive) {
-                (None, _) => "空闲",
-                (Some(_), true) => "抓取中",
-                (Some(_), false) => "会话已终止",
-            };
-            ui.label(format!("状态：{state}"));
-            ui.label(format!(
-                "画面尺寸：{}×{}",
-                self.frame_size.0, self.frame_size.1
-            ));
-            ui.label(format!("帧率：{:.1} fps", self.fps));
-            ui.label(format!("累计帧数：{}", self.total_frames));
-        });
-
-        ui.collapsing("系统自检", |ui| {
-            for (name, supported) in &self.capabilities {
-                ui.horizontal(|ui| {
-                    let mark = match supported {
-                        Some(true) => "✔",
-                        Some(false) => "✘",
-                        None => "?",
-                    };
-                    ui.label(mark);
-                    ui.label(*name);
+        ui.horizontal_wrapped(|ui| {
+            if ui.button("滚轮上").clicked() {
+                self.dispatch(Action::Scroll { ticks: 3 });
+            }
+            if ui.button("滚轮下").clicked() {
+                self.dispatch(Action::Scroll { ticks: -3 });
+            }
+            if ui.button("按下左键").clicked() {
+                self.dispatch(Action::Button {
+                    button: MouseButton::Left,
+                    down: true,
+                });
+            }
+            if ui.button("抬起左键").clicked() {
+                self.dispatch(Action::Button {
+                    button: MouseButton::Left,
+                    down: false,
                 });
             }
         });
 
-        ui.collapsing("日志", |ui| {
-            egui::ScrollArea::vertical()
-                .max_height(160.0)
-                .auto_shrink([false, false])
-                .stick_to_bottom(true)
-                .show(ui, |ui| {
-                    if self.log.is_empty() {
-                        ui.weak("暂无日志");
-                    }
-                    for line in &self.log {
-                        ui.label(line);
-                    }
-                });
+        ui.horizontal(|ui| {
+            ui.label("相对移动");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.relative_move)
+                    .desired_width(70.0)
+                    .hint_text("dx,dy"),
+            );
+            if ui.button("发送").clicked() {
+                self.send_relative();
+            }
         });
+        ui.weak("相对移动走 raw input，供鼠标被游戏捕获时使用");
+    }
+
+    fn keyboard_rows(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.add(
+                egui::TextEdit::singleline(&mut self.key_spec)
+                    .desired_width(200.0)
+                    .hint_text("Ctrl+Left 或 Left Left Space"),
+            );
+            if ui.button("发送").clicked() {
+                self.send_key_spec();
+            }
+        });
+
+        ui.horizontal_wrapped(|ui| {
+            for key in ["Left", "Right", "Up", "Down", "Space", "Enter", "Esc"] {
+                if ui.small_button(key).clicked() {
+                    self.send_combo(key);
+                }
+            }
+        });
+
+        ui.separator();
+        ui.horizontal(|ui| {
+            ui.add(
+                egui::TextEdit::singleline(&mut self.text_input)
+                    .desired_width(200.0)
+                    .hint_text("要输入的文本"),
+            );
+            if ui.button("输入").clicked() {
+                let text = std::mem::take(&mut self.text_input);
+                if text.is_empty() {
+                    self.push_log("文本为空，未发送");
+                } else {
+                    self.dispatch(Action::Text { text });
+                }
+            }
+        });
+        ui.weak("文本逐码元走 KEYEVENTF_UNICODE，不受键盘布局影响");
+    }
+
+    fn log_rows(&mut self, ui: &mut egui::Ui) {
+        egui::CollapsingHeader::new("系统自检")
+            .default_open(false)
+            .show(ui, |ui| {
+                for (name, supported) in &self.capabilities {
+                    ui.horizontal(|ui| {
+                        let mark = match supported {
+                            Some(true) => "✔",
+                            Some(false) => "✘",
+                            None => "?",
+                        };
+                        ui.label(mark);
+                        ui.label(*name);
+                    });
+                }
+            });
+
+        if ui.button("清空日志").clicked() {
+            self.log.clear();
+        }
+
+        egui::ScrollArea::vertical()
+            .max_height(260.0)
+            .auto_shrink([false, false])
+            .stick_to_bottom(true)
+            .show(ui, |ui| {
+                if self.log.is_empty() {
+                    ui.weak("暂无日志");
+                }
+                for line in &self.log {
+                    ui.label(line);
+                }
+            });
     }
 }
 
