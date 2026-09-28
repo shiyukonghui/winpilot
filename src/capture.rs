@@ -1,4 +1,5 @@
 use std::ffi::c_void;
+use std::time::Instant;
 
 use anyhow::{Context as _, Result};
 use windows_capture::{
@@ -12,23 +13,22 @@ use windows_capture::{
     window::Window,
 };
 
-use crate::types::{CaptureEvent, CaptureEventSender, FramePacket, event_channel};
-use crate::types::CaptureEventReceiver;
+use crate::types::{CaptureEvent, CaptureEventReceiver, FrameMailbox, FramePacket};
 
 /// 抓取线程上的回调：把每帧 RGBA 像素推给 UI，不持有任何窗口句柄以外的状态。
 struct PreviewHandler {
-    events_tx: CaptureEventSender,
+    events: FrameMailbox,
     scratch: Vec<u8>,
     logged_first: bool,
 }
 
 impl GraphicsCaptureApiHandler for PreviewHandler {
-    type Flags = CaptureEventSender;
+    type Flags = FrameMailbox;
     type Error = anyhow::Error;
 
     fn new(ctx: Context<Self::Flags>) -> Result<Self, Self::Error> {
         Ok(Self {
-            events_tx: ctx.flags,
+            events: ctx.flags,
             scratch: Vec::new(),
             logged_first: false,
         })
@@ -39,6 +39,9 @@ impl GraphicsCaptureApiHandler for PreviewHandler {
         frame: &mut Frame<'_>,
         _capture_control: InternalCaptureControl,
     ) -> Result<(), Self::Error> {
+        // 时间戳打在回调入口，拷贝与投递的耗时也计入预览延迟
+        let arrived_at = Instant::now();
+
         // 去掉标题栏，使抓取画面与目标窗口的客户区一一对应，后续坐标映射只需一次等比缩放
         let buffer = match frame.buffer_without_title_bar() {
             Ok(buffer) => buffer,
@@ -65,15 +68,18 @@ impl GraphicsCaptureApiHandler for PreviewHandler {
         let rgba = buffer.as_nopadding_buffer(&mut packed).to_vec();
         self.scratch = packed;
 
-        let _ = self
-            .events_tx
-            .try_send(CaptureEvent::Frame(FramePacket { rgba, width, height }));
+        self.events.push(CaptureEvent::Frame(FramePacket {
+            rgba,
+            width,
+            height,
+            captured_at: arrived_at,
+        }));
         Ok(())
     }
 
     fn on_closed(&mut self) -> Result<(), Self::Error> {
         tracing::info!("抓取会话已关闭（目标窗口销毁或不可再抓取）");
-        let _ = self.events_tx.send(CaptureEvent::Closed);
+        self.events.push(CaptureEvent::Closed);
         Ok(())
     }
 }
@@ -85,7 +91,7 @@ pub struct CaptureWorker {
 impl CaptureWorker {
     /// 启动抓取会话，返回控制句柄和帧事件接收端。
     pub fn start(hwnd: isize) -> Result<(Self, CaptureEventReceiver)> {
-        let (events_tx, events_rx) = event_channel();
+        let (events, events_rx) = FrameMailbox::bounded();
         let window = Window::from_raw_hwnd(hwnd as *mut c_void);
 
         if !window.is_valid() {
@@ -100,7 +106,7 @@ impl CaptureWorker {
             MinimumUpdateIntervalSettings::Default,
             DirtyRegionSettings::Default,
             ColorFormat::Rgba8,
-            events_tx,
+            events,
         );
 
         let control = PreviewHandler::start_free_threaded(settings)

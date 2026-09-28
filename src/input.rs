@@ -1,6 +1,6 @@
 use std::ffi::c_void;
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use windows::Win32::Foundation::HWND;
@@ -13,17 +13,24 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     MapVirtualKeyExW, SendInput, VIRTUAL_KEY,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    BringWindowToTop, GetForegroundWindow, GetWindowTextW, GetWindowThreadProcessId, IsIconic,
-    IsWindow, SetCursorPos, SetForegroundWindow, ShowWindow, SwitchToThisWindow, SW_RESTORE,
+    BringWindowToTop, GetForegroundWindow, GetGUIThreadInfo, GetWindowTextW,
+    GetWindowThreadProcessId, GUITHREADINFO, IsIconic, IsWindow, SetCursorPos, SetForegroundWindow,
+    ShowWindow, SwitchToThisWindow, SW_RESTORE,
 };
 
 use crate::keys::is_extended;
 use crate::types::{Action, InputRequest, MouseButton};
 
-/// 注入节流：Godot 按帧轮询输入，事件间隔太小会被合并或漏掉。
-const GAP: Duration = Duration::from_millis(15);
-const DOUBLE_CLICK_GAP: Duration = Duration::from_millis(60);
-const ACTIVATE_SETTLE: Duration = Duration::from_millis(80);
+/// 按下到抬起之间的保持时间。目标可能按帧轮询输入状态，保持时间过短会让一次
+/// 操作被合并成"没按过"。8ms 远小于 60fps 的 16.7ms 帧长，够用又不至于拖慢队列。
+const HOLD: Duration = Duration::from_millis(8);
+/// 连续点击之间的间隔。要小于系统双击判定间隔（默认 500ms）才会被认成双击，
+/// 又要留出 down/up 分离的时间，30ms 是两者之间的安全值。
+const MULTI_CLICK_GAP: Duration = Duration::from_millis(30);
+/// 确实切换过前台之后，最多再等这么久让键盘焦点落到目标上；已经在前台时完全不等待。
+const FOCUS_WAIT: Duration = Duration::from_millis(40);
+/// 文本走 WM_CHAR 队列，不需要保持时间，只留一点间隔避免事件洪泛。
+const TEXT_GAP: Duration = Duration::from_millis(4);
 
 /// 独立线程串行执行注入。SendInput 是同步调用且可能阻塞，绝不能跑在 UI 线程上。
 pub struct InputWorker {
@@ -36,7 +43,8 @@ impl InputWorker {
         let (tx, rx) = unbounded();
         let join = std::thread::spawn(move || {
             for request in rx.iter() {
-                execute(request, &notes_tx);
+                // rx.len() 是本条执行完之前还排着多少条，用于界面上观察积压
+                execute(request, &notes_tx, rx.len() as usize);
             }
         });
         Self {
@@ -48,25 +56,35 @@ impl InputWorker {
     pub fn send(&self, request: InputRequest) {
         let _ = self.tx.send(request);
     }
+
+    /// 还没开始执行的请求条数。持续非零说明注入速度跟不上发送速度。
+    pub fn backlog(&self) -> usize {
+        self.tx.len() as usize
+    }
 }
 
 fn note(notes: &Sender<String>, message: impl Into<String>) {
     let _ = notes.send(message.into());
 }
 
-fn execute(request: InputRequest, notes: &Sender<String>) {
+fn execute(request: InputRequest, notes: &Sender<String>, pending: usize) {
+    let started = Instant::now();
     let hwnd = HWND(request.hwnd as *mut c_void);
     if !unsafe { IsWindow(Some(hwnd)) }.as_bool() {
         note(notes, "目标窗口已不存在，操作已取消");
         return;
     }
 
-    if request.activate && !activate(hwnd) {
-        note(notes, "激活失败：目标未拿到前台焦点，注入可能被忽略");
-        return;
-    }
     if request.activate {
-        std::thread::sleep(ACTIVATE_SETTLE);
+        match activate(hwnd) {
+            // 已经在前台，不需要任何等待，这是连点时最常见的路径
+            Activation::Already => {}
+            Activation::Switched => wait_focus(hwnd),
+            Activation::Failed => {
+                note(notes, "激活失败：目标未拿到前台焦点，注入可能被忽略");
+                return;
+            }
+        }
     }
 
     let layout = key_layout(hwnd);
@@ -83,11 +101,12 @@ fn execute(request: InputRequest, notes: &Sender<String>) {
         Action::Text { text } => send_text(text, layout),
     };
 
+    let took = started.elapsed().as_millis();
     match outcome {
         Ok(()) => note(
             notes,
             format!(
-                "已发送 {}（此刻前台={}）",
+                "已发送 {} 用时{took}ms 队列剩{pending}（此刻前台={}）",
                 request.action.describe(),
                 foreground_title()
             ),
@@ -111,9 +130,23 @@ fn foreground_title() -> String {
     String::from_utf16_lossy(&buffer[..len as usize])
 }
 
+enum Activation {
+    /// 本来就是前台，不需要等待
+    Already,
+    /// 这次调用把它带到了前台，需要等一下键盘焦点跟上
+    Switched,
+    /// 系统不允许抢前台
+    Failed,
+}
+
 /// 把窗口抢到前台。SetForegroundWindow 有系统限制，需要先把输入队列挂到当前前台线程上。
-fn activate(hwnd: HWND) -> bool {
+fn activate(hwnd: HWND) -> Activation {
     unsafe {
+        // 已经是前台就不用折腾，直接省下激活等待
+        if GetForegroundWindow() == hwnd && !IsIconic(hwnd).as_bool() {
+            return Activation::Already;
+        }
+
         if IsIconic(hwnd).as_bool() {
             let _ = ShowWindow(hwnd, SW_RESTORE);
         }
@@ -134,7 +167,33 @@ fn activate(hwnd: HWND) -> bool {
         if GetForegroundWindow() != hwnd {
             SwitchToThisWindow(hwnd, true);
         }
-        GetForegroundWindow() == hwnd
+
+        if GetForegroundWindow() == hwnd {
+            Activation::Switched
+        } else {
+            Activation::Failed
+        }
+    }
+}
+
+/// 抢过前台之后，目标还要在自己的消息队列里处理 WM_ACTIVATE，键盘焦点才会真的落上去。
+/// 这里轮询到就绪就立刻返回，最多等 FOCUS_WAIT——比盲等固定 40ms 快得多，连点时体感明显。
+fn wait_focus(hwnd: HWND) {
+    let thread = unsafe { GetWindowThreadProcessId(hwnd, None) };
+    if thread == 0 {
+        return;
+    }
+    let deadline = Instant::now() + FOCUS_WAIT;
+    loop {
+        let mut info = GUITHREADINFO::default();
+        info.cbSize = size_of::<GUITHREADINFO>() as u32;
+        let ready = unsafe { GetGUIThreadInfo(thread, &mut info) }
+            .map(|()| info.hwndFocus == hwnd || info.hwndActive == hwnd)
+            .unwrap_or(false);
+        if ready || Instant::now() >= deadline {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(1));
     }
 }
 
@@ -190,14 +249,13 @@ fn press(button: MouseButton, down: bool) -> Result<(), String> {
 /// 因此不受 0..65535 归一化和多屏原点的影响。
 fn click(screen: (i32, i32), button: MouseButton, count: u32) -> Result<(), String> {
     unsafe { SetCursorPos(screen.0, screen.1) }.map_err(|error| error.to_string())?;
-    std::thread::sleep(GAP);
 
     for index in 0..count.max(1) {
         if index > 0 {
-            std::thread::sleep(DOUBLE_CLICK_GAP);
+            std::thread::sleep(MULTI_CLICK_GAP);
         }
         press(button, true)?;
-        std::thread::sleep(GAP);
+        std::thread::sleep(HOLD);
         press(button, false)?;
     }
     Ok(())
@@ -266,15 +324,15 @@ fn key(vk: u16, down: bool, layout: Option<HKL>) -> Result<(), String> {
     key_event(vk, scan, flags)
 }
 
+/// 组合键：正序按下、逆序抬起。按下与抬起之间只保持 HOLD，让目标至少有一帧
+/// 能轮询到按键状态；步骤之间不再插等待，否则连点会排成长队。
 fn combo(keys: &[u16], layout: Option<HKL>) -> Result<(), String> {
     for vk in keys {
         key(*vk, true, layout)?;
-        std::thread::sleep(GAP);
     }
-    std::thread::sleep(GAP);
+    std::thread::sleep(HOLD);
     for vk in keys.iter().rev() {
         key(*vk, false, layout)?;
-        std::thread::sleep(GAP);
     }
     Ok(())
 }
@@ -284,7 +342,7 @@ fn send_text(text: &str, _layout: Option<HKL>) -> Result<(), String> {
     for unit in text.encode_utf16() {
         key_event(0, unit, KEYEVENTF_UNICODE)?;
         key_event(0, unit, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP)?;
-        std::thread::sleep(Duration::from_millis(8));
+        std::thread::sleep(TEXT_GAP);
     }
     Ok(())
 }

@@ -40,6 +40,8 @@ pub struct WinPilotApp {
     fps: f32,
     fps_count: u32,
     fps_since: Instant,
+    /// 帧从抓取回调到达到本界面取用的平均耗时（指数滑动平均），单位毫秒
+    frame_latency_ms: f32,
     log: Vec<String>,
     capabilities: Vec<(&'static str, Option<bool>)>,
     geometry: Option<TargetGeometry>,
@@ -105,6 +107,7 @@ impl WinPilotApp {
             fps: 0.0,
             fps_count: 0,
             fps_since: Instant::now(),
+            frame_latency_ms: 0.0,
             log: Vec::new(),
             capabilities: capability_report(),
             geometry: None,
@@ -232,6 +235,7 @@ impl WinPilotApp {
                 self.fps = 0.0;
                 self.fps_count = 0;
                 self.fps_since = Instant::now();
+                self.frame_latency_ms = 0.0;
                 self.frame_is_client = None;
                 self.hover = None;
                 self.picked = None;
@@ -271,14 +275,15 @@ impl WinPilotApp {
         self.events_rx = None;
     }
 
-    /// 只取最新一帧，中间帧全部丢弃，保证预览延迟最低。
-    fn poll_frames(&mut self, ctx: &egui::Context) {
+    /// 只取最新一帧，中间帧全部丢弃，保证预览延迟最低。返回本次是否用上了新画面。
+    fn poll_frames(&mut self, ctx: &egui::Context) -> bool {
         let Some(receiver) = self.events_rx.clone() else {
-            return;
+            return false;
         };
 
         let mut latest: Option<FramePacket> = None;
         let mut target_closed = false;
+        let mut applied = false;
         while let Ok(event) = receiver.try_recv() {
             match event {
                 CaptureEvent::Frame(packet) => latest = Some(packet),
@@ -286,12 +291,17 @@ impl WinPilotApp {
             }
         }
 
-        if let Some(FramePacket {
-            rgba,
-            width,
-            height,
-        }) = latest
-        {
+        if let Some(packet) = latest {
+            applied = true;
+            let latency_ms = packet.captured_at.elapsed().as_secs_f32() * 1000.0;
+            self.frame_latency_ms += (latency_ms - self.frame_latency_ms) * 0.2;
+
+            let FramePacket {
+                rgba,
+                width,
+                height,
+                ..
+            } = packet;
             let image = egui::ColorImage::from_rgba_unmultiplied([width, height], &rgba);
             if let Some(texture) = &mut self.texture {
                 texture.set(image, egui::TextureOptions::LINEAR);
@@ -323,8 +333,6 @@ impl WinPilotApp {
                 self.fps_count = 0;
                 self.fps_since = Instant::now();
             }
-
-            ctx.request_repaint();
         }
 
         if target_closed {
@@ -334,6 +342,8 @@ impl WinPilotApp {
             self.texture = None;
             self.frame_size = (0, 0);
         }
+
+        applied
     }
 
     /// 把预览控件上的一个点换算成画面像素 / 客户区 / 屏幕三套坐标。
@@ -488,10 +498,56 @@ impl WinPilotApp {
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
+                self.status_section(ui);
                 self.target_section(ui);
                 self.mapping_section(ui);
                 self.action_section(ui);
             });
+    }
+
+    /// 运行状态读数。延迟与积压是判断"点了没反应"到底卡在哪一环节的依据。
+    fn status_section(&mut self, ui: &mut egui::Ui) {
+        let capturing = self.worker.is_some();
+        let alive = self.worker.as_ref().is_some_and(|worker| worker.is_alive());
+        let backlog = self.input.backlog();
+        let (width, height) = self.frame_size;
+
+        Self::section(ui, "状态", |ui| {
+            let state = if !capturing {
+                ("未抓取", egui::Color32::GRAY)
+            } else if alive {
+                ("抓取中", egui::Color32::from_rgb(70, 200, 130))
+            } else {
+                ("会话已终止", egui::Color32::RED)
+            };
+            ui.colored_label(state.1, state.0);
+
+            if capturing {
+                ui.monospace(format!(
+                    "画面 {:>4}×{:<4} 帧率 {:>5.1}fps",
+                    width, height, self.fps
+                ));
+                let latency = self.frame_latency_ms;
+                let color = if latency > 80.0 {
+                    egui::Color32::RED
+                } else if latency > 40.0 {
+                    egui::Color32::YELLOW
+                } else {
+                    egui::Color32::from_rgb(70, 200, 130)
+                };
+                ui.horizontal(|ui| {
+                    ui.monospace("画面延迟");
+                    ui.colored_label(color, format!("{latency:>5.1} ms"));
+                    ui.weak("抓取→界面");
+                });
+                ui.monospace(format!("已显示帧数 {:>6}", self.total_frames));
+            }
+
+            ui.monospace(format!(
+                "注入待执行 {backlog:>3}{}",
+                if backlog > 3 { "  ← 发送过快" } else { "" }
+            ));
+        });
     }
 
     fn target_section(&mut self, ui: &mut egui::Ui) {
@@ -770,12 +826,8 @@ impl WinPilotApp {
 impl eframe::App for WinPilotApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
-        self.poll_frames(&ctx);
+        let fresh = self.poll_frames(&ctx);
         self.drain_notes();
-        if self.worker.is_some() {
-            // 目标画面静止时 WGC 不再产帧，这里保持低频重绘以更新帧率与会话状态
-            ctx.request_repaint_after(std::time::Duration::from_millis(250));
-        }
 
         egui::Panel::right("controls")
             .exact_size(CONTROLS_WIDTH)
@@ -783,5 +835,15 @@ impl eframe::App for WinPilotApp {
             .show(ui, |ui| self.controls_ui(ui));
 
         egui::CentralPanel::default_margins().show(ui, |ui| self.preview_ui(ui));
+
+        // 重绘请求放在最后发：刚用上新一帧就立刻再来一次，让预览贴着抓取节奏走；
+        // 目标静止时 WGC 不再产帧，退到 250ms 心跳，只用来刷新状态读数和检测会话结束。
+        if self.worker.is_some() {
+            if fresh {
+                ctx.request_repaint();
+            } else {
+                ctx.request_repaint_after(std::time::Duration::from_millis(250));
+            }
+        }
     }
 }
