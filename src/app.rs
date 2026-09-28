@@ -1,12 +1,13 @@
+use std::sync::Arc;
 use std::time::Instant;
 
 use crate::capture::{CaptureWorker, capability_report};
 use crate::geometry::{TargetGeometry, aim_cursor, image_to_client};
-use crate::input::{InputWorker, NotesReceiver};
+use crate::input::NotesReceiver;
 use crate::keys::{parse_combo, parse_sequence};
+use crate::session::SharedSession;
 use crate::types::{Action, CaptureEvent, CaptureEventReceiver, FramePacket, InputRequest, MouseButton, WindowInfo};
 use crate::window_list::list_capturable_windows;
-use crossbeam_channel::unbounded;
 
 const CONTROLS_WIDTH: f32 = 360.0;
 const FONT_KEY: &str = "cjk";
@@ -48,7 +49,7 @@ pub struct WinPilotApp {
     frame_is_client: Option<bool>,
     hover: Option<MappedPoint>,
     picked: Option<MappedPoint>,
-    input: InputWorker,
+    session: Arc<SharedSession>,
     notes_rx: NotesReceiver,
     activate_first: bool,
     key_spec: String,
@@ -90,11 +91,13 @@ fn install_cjk_font(ctx: &egui::Context) {
 }
 
 impl WinPilotApp {
-    pub fn new(ctx: &egui::Context, auto_select: Option<&str>) -> Self {
+    pub fn new(
+        ctx: &egui::Context,
+        auto_select: Option<&str>,
+        session: Arc<SharedSession>,
+        notes_rx: NotesReceiver,
+    ) -> Self {
         install_cjk_font(ctx);
-
-        let (notes_tx, notes_rx) = unbounded();
-        let input = InputWorker::spawn(notes_tx);
 
         let mut app = Self {
             windows: Vec::new(),
@@ -114,7 +117,7 @@ impl WinPilotApp {
             frame_is_client: None,
             hover: None,
             picked: None,
-            input,
+            session,
             notes_rx,
             activate_first: true,
             key_spec: String::new(),
@@ -170,7 +173,7 @@ impl WinPilotApp {
             return;
         };
         let activate = self.activate_first;
-        self.input.send(InputRequest {
+        self.session.input.send(InputRequest {
             hwnd,
             activate,
             action,
@@ -226,7 +229,7 @@ impl WinPilotApp {
 
         let Some(hwnd) = self.selected else { return };
         match CaptureWorker::start(hwnd) {
-            Ok((worker, events_rx)) => {
+            Ok((worker, events_rx, frame_slot)) => {
                 self.worker = Some(worker);
                 self.events_rx = Some(events_rx);
                 self.texture = None;
@@ -259,6 +262,12 @@ impl WinPilotApp {
                         None
                     }
                 };
+
+                // 把会话事实镜像给 MCP server：目标、几何、最新帧槽位
+                let info = self.windows.iter().find(|w| w.hwnd == hwnd).cloned();
+                self.session.set_selected(info);
+                self.session.set_geometry(self.geometry);
+                self.session.set_frame_slot(Some(frame_slot));
             }
             Err(error) => {
                 self.geometry = None;
@@ -273,6 +282,37 @@ impl WinPilotApp {
             self.push_log("抓取已停止");
         }
         self.events_rx = None;
+        self.session.set_frame_slot(None);
+    }
+
+    /// MCP 的 select_window 在共享会话里排队，这里取走并当作本机的选择执行。
+    /// 抓取会话的生命周期始终由 GUI 统一管理。
+    ///
+    /// 同一窗口且画面仍然新鲜时跳过重启；其余情况（换了目标、上次启动失败、
+    /// 窗口最小化导致断帧）都重新走一遍启动流程——启动会顺带恢复最小化的窗口。
+    fn handle_pending_select(&mut self) {
+        let pending = self
+            .session
+            .pending_select
+            .lock()
+            .ok()
+            .and_then(|mut guard| guard.take());
+        let Some(hwnd) = pending else { return };
+
+        if self.selected == Some(hwnd) {
+            let fresh = self.worker.as_ref().is_some_and(|worker| worker.is_alive())
+                && self
+                    .session
+                    .frame_slot()
+                    .and_then(|slot| slot.age_ms())
+                    .is_some_and(|age| age < 1000);
+            if fresh {
+                return;
+            }
+        }
+
+        self.selected = Some(hwnd);
+        self.start_capture();
     }
 
     /// 只取最新一帧，中间帧全部丢弃，保证预览延迟最低。返回本次是否用上了新画面。
@@ -281,7 +321,7 @@ impl WinPilotApp {
             return false;
         };
 
-        let mut latest: Option<FramePacket> = None;
+        let mut latest: Option<Arc<FramePacket>> = None;
         let mut target_closed = false;
         let mut applied = false;
         while let Ok(event) = receiver.try_recv() {
@@ -296,13 +336,8 @@ impl WinPilotApp {
             let latency_ms = packet.captured_at.elapsed().as_secs_f32() * 1000.0;
             self.frame_latency_ms += (latency_ms - self.frame_latency_ms) * 0.2;
 
-            let FramePacket {
-                rgba,
-                width,
-                height,
-                ..
-            } = packet;
-            let image = egui::ColorImage::from_rgba_unmultiplied([width, height], &rgba);
+            let (width, height) = (packet.width, packet.height);
+            let image = egui::ColorImage::from_rgba_unmultiplied([width, height], &packet.rgba);
             if let Some(texture) = &mut self.texture {
                 texture.set(image, egui::TextureOptions::LINEAR);
             } else {
@@ -332,6 +367,9 @@ impl WinPilotApp {
                 self.fps = self.fps_count as f32 / elapsed;
                 self.fps_count = 0;
                 self.fps_since = Instant::now();
+                if let Ok(mut mirror) = self.session.fps.lock() {
+                    *mirror = self.fps;
+                }
             }
         }
 
@@ -509,7 +547,7 @@ impl WinPilotApp {
     fn status_section(&mut self, ui: &mut egui::Ui) {
         let capturing = self.worker.is_some();
         let alive = self.worker.as_ref().is_some_and(|worker| worker.is_alive());
-        let backlog = self.input.backlog();
+        let backlog = self.session.input.backlog();
         let (width, height) = self.frame_size;
 
         Self::section(ui, "状态", |ui| {
@@ -826,6 +864,7 @@ impl WinPilotApp {
 impl eframe::App for WinPilotApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        self.handle_pending_select();
         let fresh = self.poll_frames(&ctx);
         self.drain_notes();
 
@@ -837,13 +876,12 @@ impl eframe::App for WinPilotApp {
         egui::CentralPanel::default_margins().show(ui, |ui| self.preview_ui(ui));
 
         // 重绘请求放在最后发：刚用上新一帧就立刻再来一次，让预览贴着抓取节奏走；
-        // 目标静止时 WGC 不再产帧，退到 250ms 心跳，只用来刷新状态读数和检测会话结束。
-        if self.worker.is_some() {
-            if fresh {
-                ctx.request_repaint();
-            } else {
-                ctx.request_repaint_after(std::time::Duration::from_millis(250));
-            }
+        // 其余情况退到 250ms 心跳——除了刷新状态读数，还要及时处理 MCP 的 select_window，
+        // 空闲时界面没有其他重绘来源，漏掉心跳会让外部请求永远等不到执行。
+        if fresh {
+            ctx.request_repaint();
+        } else {
+            ctx.request_repaint_after(std::time::Duration::from_millis(250));
         }
     }
 }

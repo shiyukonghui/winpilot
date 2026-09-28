@@ -3,9 +3,12 @@ mod capture;
 mod geometry;
 mod input;
 mod keys;
+mod mcp_server;
+mod session;
 mod types;
 mod window_list;
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result};
@@ -66,14 +69,40 @@ fn main() -> Result<()> {
     };
 
     let auto = flag_value(&args, "--auto").map(str::to_owned);
+
+    // 共享会话：GUI 与 MCP server 操作同一个实例
+    let (notes_tx, notes_rx) = unbounded();
+    let input = input::InputWorker::spawn(notes_tx);
+    let session = std::sync::Arc::new(session::SharedSession::new(input));
+
     eframe::run_native(
         "WinPilot",
         options,
-        Box::new(move |cc| Ok(Box::new(WinPilotApp::new(&cc.egui_ctx, auto.as_deref())))),
+        Box::new(move |cc| {
+            // MCP server 要用真实的 GUI Context 来唤醒界面处理 select_window
+            if let Some(port) = mcp_port(&args) {
+                mcp_server::start(session.clone(), cc.egui_ctx.clone(), Some(port));
+            }
+            Ok(Box::new(WinPilotApp::new(
+                &cc.egui_ctx,
+                auto.as_deref(),
+                session.clone(),
+                notes_rx,
+            )))
+        }),
     )
     .context("界面初始化失败")?;
 
     Ok(())
+}
+
+/// `--mcp` 开启 MCP server；可带端口参数（`--mcp 9100`），默认 8100。
+fn mcp_port(args: &[String]) -> Option<u16> {
+    args.iter().position(|a| a == "--mcp").map(|index| {
+        args.get(index + 1)
+            .and_then(|value| value.parse::<u16>().ok())
+            .unwrap_or(8100)
+    })
 }
 
 fn flag_value<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
@@ -107,7 +136,7 @@ fn capture_self_test(pattern: &str) -> Result<()> {
         info.height
     );
 
-    let (worker, receiver) = CaptureWorker::start(info.hwnd)?;
+    let (worker, receiver, _frame_slot) = CaptureWorker::start(info.hwnd)?;
     let started = Instant::now();
     let mut frames = 0_u32;
 
@@ -159,7 +188,7 @@ fn send_self_test(pattern: &str, specs: &[String]) -> Result<()> {
     let hwnd = info.hwnd;
     let geometry = geometry::TargetGeometry::query(hwnd)?;
 
-    let (worker, receiver) = CaptureWorker::start(hwnd)?;
+    let (worker, receiver, _frame_slot) = CaptureWorker::start(hwnd)?;
     let first = latest_frame(&receiver).context("没收到画面，无法换算点击坐标")?;
     let frame_size = (first.width, first.height);
     println!("[send] 画面 {frame_size:?} 客户区 {}×{}", geometry.client_w, geometry.client_h);
@@ -175,7 +204,7 @@ fn send_self_test(pattern: &str, specs: &[String]) -> Result<()> {
     drop(first);
 
     let before = latest_frame(&receiver);
-    println!("[send] 发送前 {}", describe(before.as_ref()));
+    println!("[send] 发送前 {}", describe(before.as_deref()));
 
     for action in actions {
         input.send(InputRequest {
@@ -198,7 +227,7 @@ fn send_self_test(pattern: &str, specs: &[String]) -> Result<()> {
     }
 
     let after = latest_frame(&receiver);
-    println!("[send] 发送后 {}", describe(after.as_ref()));
+    println!("[send] 发送后 {}", describe(after.as_deref()));
     if let (Some(before), Some(after)) = (&before, &after) {
         let (changed, bbox) = diff_frames(before, after);
         println!("[send] 变化像素 {changed}，包围盒 {bbox:?}");
@@ -225,7 +254,7 @@ fn latency_self_test(pattern: &str, specs: &[String]) -> Result<()> {
     let hwnd = info.hwnd;
     let geometry = geometry::TargetGeometry::query(hwnd)?;
 
-    let (worker, receiver) = CaptureWorker::start(hwnd)?;
+    let (worker, receiver, _frame_slot) = CaptureWorker::start(hwnd)?;
     let first = latest_frame(&receiver).context("没收到画面，目标可能完全静止")?;
     let frame_size = (first.width, first.height);
     drop(first);
@@ -251,7 +280,7 @@ fn latency_self_test(pattern: &str, specs: &[String]) -> Result<()> {
             println!("[latency] {spec}: 目标画面静止，收不到基准帧，跳过");
             continue;
         };
-        let baseline_hash = fnv(&baseline.rgba);
+        let baseline_hash = types::frame_checksum(&baseline.rgba);
 
         let sent = Instant::now();
         input.send(InputRequest {
@@ -264,7 +293,7 @@ fn latency_self_test(pattern: &str, specs: &[String]) -> Result<()> {
         while sent.elapsed() < Duration::from_millis(1200) {
             if let Ok(CaptureEvent::Frame(packet)) = receiver.recv_timeout(Duration::from_millis(20)) {
                 stale_max = stale_max.max(packet.captured_at.elapsed());
-                if fnv(&packet.rgba) != baseline_hash {
+                if types::frame_checksum(&packet.rgba) != baseline_hash {
                     // 以该帧的抓取时刻为准，而不是本进程轮到它的时刻，否则把轮询间隔也算成了延迟
                     let since = packet.captured_at.saturating_duration_since(sent);
                     hit = Some((since, packet));
@@ -307,9 +336,9 @@ fn steady_frame(
     receiver: &CaptureEventReceiver,
     window: Duration,
     stale_max: &mut Duration,
-) -> Option<FramePacket> {
+) -> Option<Arc<FramePacket>> {
     let deadline = Instant::now() + window;
-    let mut last = None;
+    let mut last: Option<Arc<FramePacket>> = None;
     while Instant::now() < deadline {
         if let Ok(CaptureEvent::Frame(packet)) = receiver.recv_timeout(Duration::from_millis(40)) {
             *stale_max = (*stale_max).max(packet.captured_at.elapsed());
@@ -424,7 +453,7 @@ fn build_action(
 }
 
 /// 取一小段时间内的最后一帧，代表该时刻的稳定画面。
-fn latest_frame(receiver: &CaptureEventReceiver) -> Option<FramePacket> {
+fn latest_frame(receiver: &CaptureEventReceiver) -> Option<Arc<FramePacket>> {
     let mut last = None;
     let deadline = Instant::now() + Duration::from_millis(400);
     while Instant::now() < deadline {
@@ -443,20 +472,12 @@ fn describe(frame: Option<&FramePacket>) -> String {
             "{}×{} 校验和={:016x}",
             frame.width,
             frame.height,
-            fnv(&frame.rgba)
+            types::frame_checksum(&frame.rgba)
         ),
         None => "无画面".to_owned(),
     }
 }
 
-fn fnv(bytes: &[u8]) -> u64 {
-    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
-    for byte in bytes {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    hash
-}
 
 fn diff_frames(a: &FramePacket, b: &FramePacket) -> (u64, Option<(usize, usize, usize, usize)>) {
     if a.width != b.width || a.height != b.height {
@@ -517,7 +538,7 @@ fn mapping_self_test(pattern: &str, args: &[String]) -> Result<()> {
         geometry.awareness
     );
 
-    let (worker, receiver) = CaptureWorker::start(info.hwnd)?;
+    let (worker, receiver, _frame_slot) = CaptureWorker::start(info.hwnd)?;
     let mut frame = (0_usize, 0_usize);
     let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline {

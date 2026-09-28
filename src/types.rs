@@ -1,3 +1,4 @@
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use crossbeam_channel::{Receiver, Sender};
@@ -11,14 +12,23 @@ pub struct WindowInfo {
     pub pid: u32,
     pub width: i32,
     pub height: i32,
+    /// 窗口是否处于最小化状态。最小化的窗口收不到 WGC 帧，抓取前要先恢复。
+    pub minimized: bool,
 }
 
 impl WindowInfo {
     pub fn label(&self) -> String {
-        format!(
-            "{} · {}  ({}×{})",
-            self.process_name, self.title, self.width, self.height
-        )
+        if self.minimized {
+            format!(
+                "{} · {}  ({}×{}, 已最小化)",
+                self.process_name, self.title, self.width, self.height
+            )
+        } else {
+            format!(
+                "{} · {}  ({}×{})",
+                self.process_name, self.title, self.width, self.height
+            )
+        }
     }
 }
 
@@ -30,8 +40,32 @@ pub struct FramePacket {
     pub captured_at: Instant,
 }
 
+/// 最新一帧的共享槽位。抓取回调写入，MCP 的 screenshot 等工具读取，
+/// 与预览信箱互不干扰：UI 走信箱，外部工具走槽位。
+#[derive(Clone, Default)]
+pub struct FrameSlot(Arc<Mutex<Option<Arc<FramePacket>>>>);
+
+impl FrameSlot {
+    pub fn get(&self) -> Option<Arc<FramePacket>> {
+        self.0.lock().ok().and_then(|slot| slot.clone())
+    }
+
+    /// 帧龄（毫秒），调用方据此判断画面是否新鲜。
+    pub fn age_ms(&self) -> Option<u128> {
+        self.get()
+            .map(|packet| packet.captured_at.elapsed().as_millis())
+    }
+
+    pub fn set(&self, packet: Arc<FramePacket>) {
+        if let Ok(mut slot) = self.0.lock() {
+            *slot = Some(packet);
+        }
+    }
+
+}
+
 pub enum CaptureEvent {
-    Frame(FramePacket),
+    Frame(Arc<FramePacket>),
     Closed,
 }
 
@@ -104,6 +138,17 @@ pub struct InputRequest {
 pub type CaptureEventSender = Sender<CaptureEvent>;
 pub type CaptureEventReceiver = Receiver<CaptureEvent>;
 
+/// 帧内容的 FNV-1a 校验和。两次读数不同即画面发生了变化，
+/// 供 MCP 工具用很小的代价做"操作是否生效"的判定。
+pub fn frame_checksum(rgba: &[u8]) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for byte in rgba {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
 /// 预览事件通道：容量 1，并且投递前先把压在里面的旧帧挤掉。
 ///
 /// 抓取端比 UI 快时，丢的必须是旧帧而不是新帧——否则界面上永远显示过期画面，
@@ -113,6 +158,7 @@ pub type CaptureEventReceiver = Receiver<CaptureEvent>;
 pub struct FrameMailbox {
     tx: CaptureEventSender,
     stale: CaptureEventReceiver,
+    slot: FrameSlot,
 }
 
 impl FrameMailbox {
@@ -121,11 +167,20 @@ impl FrameMailbox {
         let mailbox = Self {
             tx: tx.clone(),
             stale: rx.clone(),
+            slot: FrameSlot::default(),
         };
         (mailbox, rx)
     }
 
+    /// 本信箱对应的最新帧槽位，交给需要旁路读帧的组件（例如 MCP 的 screenshot）。
+    pub fn slot(&self) -> FrameSlot {
+        self.slot.clone()
+    }
+
     pub fn push(&self, event: CaptureEvent) {
+        if let CaptureEvent::Frame(packet) = &event {
+            self.slot.set(packet.clone());
+        }
         let retry = match self.tx.try_send(event) {
             Ok(()) => return,
             Err(crossbeam_channel::TrySendError::Full(event)) => event,

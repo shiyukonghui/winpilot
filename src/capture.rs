@@ -1,7 +1,10 @@
 use std::ffi::c_void;
-use std::time::Instant;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result};
+use windows::Win32::Foundation::HWND;
+use windows::Win32::UI::WindowsAndMessaging::{IsIconic, ShowWindow, SW_RESTORE};
 use windows_capture::{
     capture::{Context, GraphicsCaptureApiHandler},
     frame::Frame,
@@ -13,7 +16,9 @@ use windows_capture::{
     window::Window,
 };
 
-use crate::types::{CaptureEvent, CaptureEventReceiver, FrameMailbox, FramePacket};
+use crate::types::{
+    CaptureEvent, CaptureEventReceiver, FrameMailbox, FramePacket, FrameSlot,
+};
 
 /// 抓取线程上的回调：把每帧 RGBA 像素推给 UI，不持有任何窗口句柄以外的状态。
 struct PreviewHandler {
@@ -68,12 +73,12 @@ impl GraphicsCaptureApiHandler for PreviewHandler {
         let rgba = buffer.as_nopadding_buffer(&mut packed).to_vec();
         self.scratch = packed;
 
-        self.events.push(CaptureEvent::Frame(FramePacket {
+        self.events.push(CaptureEvent::Frame(Arc::new(FramePacket {
             rgba,
             width,
             height,
             captured_at: arrived_at,
-        }));
+        })));
         Ok(())
     }
 
@@ -89,13 +94,22 @@ pub struct CaptureWorker {
 }
 
 impl CaptureWorker {
-    /// 启动抓取会话，返回控制句柄和帧事件接收端。
-    pub fn start(hwnd: isize) -> Result<(Self, CaptureEventReceiver)> {
+    /// 启动抓取会话，返回控制句柄、帧事件接收端和最新帧槽位（供旁路读帧）。
+    pub fn start(hwnd: isize) -> Result<(Self, CaptureEventReceiver, FrameSlot)> {
         let (events, events_rx) = FrameMailbox::bounded();
+        let frame_slot = events.slot();
         let window = Window::from_raw_hwnd(hwnd as *mut c_void);
 
         if !window.is_valid() {
-            anyhow::bail!("目标窗口当前不可抓取（已最小化、已关闭或为工具窗口）");
+            anyhow::bail!("目标窗口当前不可抓取（已关闭或为工具窗口）");
+        }
+
+        // 最小化的窗口不产生 WGC 帧，先恢复并等布局完成，否则会话起来后只有一张旧帧
+        let target = HWND(hwnd as *mut c_void);
+        if unsafe { IsIconic(target) }.as_bool() {
+            let _ = unsafe { ShowWindow(target, SW_RESTORE) };
+            std::thread::sleep(Duration::from_millis(150));
+            tracing::info!("目标窗口处于最小化，已自动恢复");
         }
 
         let settings = Settings::new(
@@ -112,7 +126,7 @@ impl CaptureWorker {
         let control = PreviewHandler::start_free_threaded(settings)
             .with_context(|| format!("WGC 会话启动失败 (hwnd=0x{hwnd:X})"))?;
 
-        Ok((Self { control }, events_rx))
+        Ok((Self { control }, events_rx, frame_slot))
     }
 
     pub fn stop(self) {

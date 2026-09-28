@@ -10,12 +10,12 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     KEYBD_EVENT_FLAGS, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, MAPVK_VK_TO_VSC,
     MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP,
     MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_WHEEL, MOUSEINPUT, MOUSE_EVENT_FLAGS,
-    MapVirtualKeyExW, SendInput, VIRTUAL_KEY,
+    MapVirtualKeyExW, SendInput, SetActiveWindow, SetFocus, VIRTUAL_KEY, VK_MENU,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     BringWindowToTop, GetForegroundWindow, GetGUIThreadInfo, GetWindowTextW,
     GetWindowThreadProcessId, GUITHREADINFO, IsIconic, IsWindow, SetCursorPos, SetForegroundWindow,
-    ShowWindow, SwitchToThisWindow, SW_RESTORE,
+    ShowWindow, SwitchToThisWindow, SW_MINIMIZE, SW_SHOW, SW_RESTORE,
 };
 
 use crate::keys::is_extended;
@@ -31,20 +31,38 @@ const MULTI_CLICK_GAP: Duration = Duration::from_millis(30);
 const FOCUS_WAIT: Duration = Duration::from_millis(40);
 /// 文本走 WM_CHAR 队列，不需要保持时间，只留一点间隔避免事件洪泛。
 const TEXT_GAP: Duration = Duration::from_millis(4);
+/// 最小化恢复后等窗口重排、焦点重建的时长；不等的话第一拍注入会被吞掉。
+const RESTORE_SETTLE: Duration = Duration::from_millis(80);
 
 /// 独立线程串行执行注入。SendInput 是同步调用且可能阻塞，绝不能跑在 UI 线程上。
+/// GUI 走 `send`（结果进日志），MCP 工具走 `execute_and_wait`（同步拿回执），
+/// 两条路径共用同一条队列，注入顺序始终串行。
+struct Job {
+    request: InputRequest,
+    reply: Option<Sender<Result<String, String>>>,
+}
+
 pub struct InputWorker {
-    tx: Sender<InputRequest>,
+    tx: Sender<Job>,
     _join: JoinHandle<()>,
 }
 
 impl InputWorker {
     pub fn spawn(notes_tx: Sender<String>) -> Self {
-        let (tx, rx) = unbounded();
+        let (tx, rx) = unbounded::<Job>();
         let join = std::thread::spawn(move || {
-            for request in rx.iter() {
+            for job in rx.iter() {
                 // rx.len() 是本条执行完之前还排着多少条，用于界面上观察积压
-                execute(request, &notes_tx, rx.len() as usize);
+                let pending = rx.len() as usize;
+                let result = execute(job.request, pending);
+                match job.reply {
+                    Some(reply) => {
+                        let _ = reply.send(result);
+                    }
+                    None => match result {
+                        Ok(text) | Err(text) => note(&notes_tx, text),
+                    },
+                }
             }
         });
         Self {
@@ -54,7 +72,28 @@ impl InputWorker {
     }
 
     pub fn send(&self, request: InputRequest) {
-        let _ = self.tx.send(request);
+        let _ = self.tx.send(Job {
+            request,
+            reply: None,
+        });
+    }
+
+    /// 同步执行并拿回执，供 MCP 工具向外部模型返回结构化结果。
+    pub fn execute_and_wait(
+        &self,
+        request: InputRequest,
+        timeout: Duration,
+    ) -> Result<String, String> {
+        let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
+        self.tx
+            .send(Job {
+                request,
+                reply: Some(reply_tx),
+            })
+            .map_err(|_| "注入线程已退出".to_owned())?;
+        reply_rx
+            .recv_timeout(timeout)
+            .unwrap_or_else(|_| Err("注入执行超时".to_owned()))
     }
 
     /// 还没开始执行的请求条数。持续非零说明注入速度跟不上发送速度。
@@ -67,12 +106,11 @@ fn note(notes: &Sender<String>, message: impl Into<String>) {
     let _ = notes.send(message.into());
 }
 
-fn execute(request: InputRequest, notes: &Sender<String>, pending: usize) {
+fn execute(request: InputRequest, pending: usize) -> Result<String, String> {
     let started = Instant::now();
     let hwnd = HWND(request.hwnd as *mut c_void);
     if !unsafe { IsWindow(Some(hwnd)) }.as_bool() {
-        note(notes, "目标窗口已不存在，操作已取消");
-        return;
+        return Err("目标窗口已不存在，操作已取消".to_owned());
     }
 
     if request.activate {
@@ -81,8 +119,7 @@ fn execute(request: InputRequest, notes: &Sender<String>, pending: usize) {
             Activation::Already => {}
             Activation::Switched => wait_focus(hwnd),
             Activation::Failed => {
-                note(notes, "激活失败：目标未拿到前台焦点，注入可能被忽略");
-                return;
+                return Err("激活失败：目标未拿到前台焦点，注入可能被忽略".to_owned());
             }
         }
     }
@@ -102,17 +139,12 @@ fn execute(request: InputRequest, notes: &Sender<String>, pending: usize) {
     };
 
     let took = started.elapsed().as_millis();
-    match outcome {
-        Ok(()) => note(
-            notes,
-            format!(
-                "已发送 {} 用时{took}ms 队列剩{pending}（此刻前台={}）",
-                request.action.describe(),
-                foreground_title()
-            ),
-        ),
-        Err(error) => note(notes, format!("{} 失败：{error}", request.action.describe())),
-    }
+    let summary = format!(
+        "{} 用时{took}ms 队列剩{pending}（此刻前台={}）",
+        request.action.describe(),
+        foreground_title()
+    );
+    outcome.map(|()| summary)
 }
 
 /// 回读真正的前台窗口标题。SendInput 返回成功只代表事件入队，
@@ -139,7 +171,7 @@ enum Activation {
     Failed,
 }
 
-/// 把窗口抢到前台。SetForegroundWindow 有系统限制，需要先把输入队列挂到当前前台线程上。
+/// 把窗口抢到前台。Windows 对抢前台有多重限制，按强度递进尝试三级手段。
 fn activate(hwnd: HWND) -> Activation {
     unsafe {
         // 已经是前台就不用折腾，直接省下激活等待
@@ -149,8 +181,47 @@ fn activate(hwnd: HWND) -> Activation {
 
         if IsIconic(hwnd).as_bool() {
             let _ = ShowWindow(hwnd, SW_RESTORE);
+        } else {
+            let _ = ShowWindow(hwnd, SW_SHOW);
         }
 
+        // 第一级：常规的输入队列挂靠 + SetForegroundWindow
+        if bring_to_front(hwnd) {
+            return Activation::Switched;
+        }
+
+        // 第二级：按住 ALT 跨越激活调用。Windows 只允许"最近处理过输入"的进程抢前台，
+        // 外部模型经 MCP 触发注入时本进程没有焦点，模拟一次按键即获得资格。
+        let _ = key_event(VK_MENU.0, 0, KEYBD_EVENT_FLAGS(0));
+        let ok = bring_to_front(hwnd);
+        let _ = key_event(VK_MENU.0, 0, KEYEVENTF_KEYUP);
+        if ok {
+            return Activation::Switched;
+        }
+
+        // 第三级：最小化再恢复。窗口从最小化恢复时系统直接把它带到前台，
+        // 不受前台锁限制；代价是目标窗口闪一下，所以放在 ALT 无效之后。
+        // 恢复后目标还要重排窗口、重建输入焦点，立刻注入的第一拍会被吞掉，
+        // 这里等它稳定再返回。
+        let _ = ShowWindow(hwnd, SW_MINIMIZE);
+        let _ = ShowWindow(hwnd, SW_RESTORE);
+        std::thread::sleep(RESTORE_SETTLE);
+        if GetForegroundWindow() == hwnd {
+            return Activation::Switched;
+        }
+
+        // 第四级：系统仍拒绝时不再改变可见前台，直接把键盘焦点挂到目标窗口，
+        // 键盘事件跟着焦点走，注入仍然有效。
+        if steal_focus(hwnd) {
+            return Activation::Switched;
+        }
+
+        Activation::Failed
+    }
+}
+
+fn bring_to_front(hwnd: HWND) -> bool {
+    unsafe {
         let current_thread = GetCurrentThreadId();
         let foreground_thread = GetWindowThreadProcessId(GetForegroundWindow(), None);
         let attached = foreground_thread != 0
@@ -167,12 +238,26 @@ fn activate(hwnd: HWND) -> Activation {
         if GetForegroundWindow() != hwnd {
             SwitchToThisWindow(hwnd, true);
         }
+        GetForegroundWindow() == hwnd
+    }
+}
 
-        if GetForegroundWindow() == hwnd {
-            Activation::Switched
-        } else {
-            Activation::Failed
+/// 不改前台，直接把键盘焦点设到目标窗口。需要先把两个线程的输入队列挂在一起。
+fn steal_focus(hwnd: HWND) -> bool {
+    unsafe {
+        let current_thread = GetCurrentThreadId();
+        let target_thread = GetWindowThreadProcessId(hwnd, None);
+        let attached = target_thread != 0
+            && target_thread != current_thread
+            && AttachThreadInput(current_thread, target_thread, true).as_bool();
+
+        let active = SetActiveWindow(hwnd);
+        let focused = SetFocus(Some(hwnd));
+
+        if attached {
+            let _ = AttachThreadInput(current_thread, target_thread, false);
         }
+        active.is_ok() && focused.is_ok()
     }
 }
 
