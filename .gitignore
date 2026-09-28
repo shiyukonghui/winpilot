@@ -1,0 +1,18 @@
+# 构建产物（本目录 target/ 已达 2.9GB，必须排除）
+/target
+
+# 手工验证过程的临时产物：截图、运行日志、PowerShell 驱动脚本
+/.scratch
+
+# 任何位置的日志与临时文件
+*.log
+*.tmp
+
+# 编辑器与系统垃圾
+/.idea
+/.vscode
+*.swp
+Thumbs.db
+Desktop.ini
+
+# Cargo.lock 对二进制工程要提交，锁定依赖版本，不要加进这里
