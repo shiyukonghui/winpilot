@@ -1,0 +1,20 @@
+# 仓库内一律以 LF 存储文本，检出也用 LF，行为与本机 core.autocrlf 解耦，
+# 否则换一台 autocrlf=false 的机器克隆就会产生整文件级 diff。
+* text=auto eol=lf
+
+# 二进制类型显式声明，避免被当文本做行尾转换或逐行 diff
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.ttf binary
+*.otf binary
+*.woff binary
+*.dll binary
+*.exe binary
+*.lib binary
+*.pdb binary
+
+# 生成的锁文件只按文本归一，不做合并冲突自动处理
+Cargo.lock merge=binary
